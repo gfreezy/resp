@@ -9,6 +9,16 @@ repository = "https://github.com/iorust/resp.git"
 readme = "README.md"
 keywords = ["redis", "resp", "serialization"]
 license = "MIT/Apache-2.0"
+edition = "2018"
+
+[dependencies]
+nom = "5"
+bytes = "0.4.12"
 
 [dev-dependencies]
-rand = "0.3"
+rand = "0.7"
+criterion = "0.3"
+
+[[bench]]
+name = "lib"
+harness = false

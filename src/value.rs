@@ -1,44 +1,48 @@
 //! RESP Value
 
-use std::vec::Vec;
-use std::string::String;
-use std::marker::{Send, Sync};
-use std::io::{Result, Error, ErrorKind};
 use super::serialize::encode;
+use crate::parser::parse_resp_value;
+use bytes::BytesMut;
+use std::vec::Vec;
+use nom::error::ErrorKind;
 
-/// Represents a RESP value, see [Redis Protocol specification](http://redis.io/topics/protocol).
-#[derive(Clone, Eq, PartialEq, Debug)]
-pub enum Value {
-    /// Null bulk reply, `$-1\r\n`
-    Null,
-    /// Null array reply, `*-1\r\n`
-    NullArray,
-    /// For Simple Strings the first byte of the reply is "+".
-    String(String),
-    /// For Errors the first byte of the reply is "-".
-    Error(String),
-    /// For Integers the first byte of the reply is ":".
-    Integer(i64),
-    /// For Bulk Strings the first byte of the reply is "$".
-    Bulk(String),
-    /// For Bulk <binary> Strings the first byte of the reply is "$".
-    BufBulk(Vec<u8>),
-    /// For Arrays the first byte of the reply is "*".
-    Array(Vec<Value>),
+enum Error {
+    InvalidData,
+    NeedMoreData,
 }
 
-impl Value {
+pub type Slice<'a> = &'a [u8];
+
+/// Represents a RESP value, see [Redis Protocol specification](http://redis.io/topics/protocol).
+#[derive(Debug, PartialEq)]
+pub enum Value<'a> {
+    SimpleString(Slice<'a>),
+    Error(Slice<'a>),
+    Integer(i64),
+    BulkString(Option<Slice<'a>>),
+    Array(Option<Vec<Value<'a>>>),
+}
+
+impl<'a> Value<'a> {
+    pub fn parse(buf: Slice) -> Result<(Slice, Value), Error> {
+        match parse_resp_value(buf) {
+            v @ Ok(_) => v,
+            Err(nom::Err::Incomplete(n)) => Err(Error::NeedMoreData),
+            Err(nom::Err::Error(e)) | Err(nom::Err::Failure(e)) => ,
+        }
+    }
+
     /// Returns `true` if the value is a `Null` or `NullArray`. Returns `false` otherwise.
     /// # Examples
     /// ```
     /// # use self::resp::{Value};
-    /// assert_eq!(Value::Null.is_null(), true);
-    /// assert_eq!(Value::NullArray.is_null(), true);
+    /// assert_eq!(Value::Array(None).is_null(), true);
+    /// assert_eq!(Value::BulkString(None).is_null(), true);
     /// assert_eq!(Value::Integer(123).is_null(), false);
     /// ```
     pub fn is_null(&self) -> bool {
         match *self {
-            Value::Null | Value::NullArray => true,
+            Value::Array(None) | Value::BulkString(None) => true,
             _ => false,
         }
     }
@@ -47,8 +51,8 @@ impl Value {
     /// # Examples
     /// ```
     /// # use self::resp::{Value};
-    /// assert_eq!(Value::Null.is_error(), false);
-    /// assert_eq!(Value::Error("".to_string()).is_error(), true);
+    /// assert_eq!(Value::SimpleString(b"aa").is_error(), false);
+    /// assert_eq!(Value::Error(b"").is_error(), true);
     /// ```
     pub fn is_error(&self) -> bool {
         match *self {
@@ -57,183 +61,41 @@ impl Value {
         }
     }
 
+    pub fn encode(&self, buf: &mut BytesMut) -> usize {
+        encode(self, buf)
+    }
+
     /// Encode the value to RESP binary buffer.
     /// # Examples
     /// ```
     /// # use self::resp::{Value};
-    /// let val = Value::String("OK正".to_string());
-    /// assert_eq!(val.encode(), vec![43, 79, 75, 230, 173, 163, 13, 10]);
+    /// let val = Value::SimpleString("OK正".as_bytes());
+    /// assert_eq!(val.to_vec(), vec![43, 79, 75, 230, 173, 163, 13, 10]);
     /// ```
-    pub fn encode(&self) -> Vec<u8> {
-        encode(self)
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        self.encode(&mut buf);
+        buf.to_vec()
     }
 
-    /// Encode the value to RESP string.
-    /// # Examples
-    /// ```
-    /// # use self::resp::{Value};
-    /// let val = Value::String("OK正".to_string());
-    /// assert_eq!(val.to_encoded_string().unwrap(), "+OK正\r\n");
-    /// ```
-    pub fn to_encoded_string(&self) -> Result<String> {
-        let bytes = self.encode();
-        String::from_utf8(bytes).map_err(|err| Error::new(ErrorKind::InvalidData, err))
-    }
-
-    /// Encode the value to beautify formated string.
-    /// # Examples
-    /// ```
-    /// # use self::resp::{Value};
-    /// assert_eq!(Value::Null.to_string_pretty(), "(Null)");
-    /// assert_eq!(Value::NullArray.to_string_pretty(), "(Null Array)");
-    /// assert_eq!(Value::String("OK".to_string()).to_string_pretty(), "OK");
-    /// assert_eq!(Value::Error("Err".to_string()).to_string_pretty(), "(Error) Err");
-    /// assert_eq!(Value::Integer(123).to_string_pretty(), "(Integer) 123");
-    /// assert_eq!(Value::Bulk("Bulk String".to_string()).to_string_pretty(), "\"Bulk String\"");
-    /// assert_eq!(Value::BufBulk(vec![]).to_string_pretty(), "(Empty Buffer)");
-    /// assert_eq!(Value::BufBulk(vec![0, 100]).to_string_pretty(), "(Buffer) 00 64");
-    /// assert_eq!(Value::Array(vec![]).to_string_pretty(), "(Empty Array)");
-    /// ```
-    ///
-    /// A full formated example:
-    ///
-    /// ```bash
-    ///  1) (Null)
-    ///  2) (Null Array)
-    ///  3) OK
-    ///  4) (Error) Err
-    ///  5) (Integer) 123
-    ///  6) \"Bulk String\"
-    ///  7) (Empty Array)
-    ///  8) (Buffer) 00 64
-    ///  9) 1) (Empty Array)
-    ///     2) (Integer) 123
-    ///     3) \"Bulk String\"
-    /// 10) 1) (Null)
-    ///     2) (Null Array)
-    ///     3) OK
-    ///     4) (Error) Err
-    ///     5) (Integer) 123
-    ///     6) \"Bulk String\"
-    ///     7) (Empty Array)
-    ///     8) (Buffer) 00 64
-    ///     9) 1) (Empty Array)
-    ///        2) (Integer) 123
-    ///        3) \"Bulk String\"
-    /// 11) (Null)
-    /// 12) 1) (Null)
-    ///     2) (Null Array)
-    ///     3) OK
-    ///     4) (Error) Err
-    ///     5) (Integer) 123
-    ///     6) \"Bulk String\"
-    ///     7) (Empty Array)
-    ///     8) (Buffer) 00 64
-    ///     9) 1) (Empty Array)
-    ///        2) (Integer) 123
-    ///        3) \"Bulk String\"
-    ///    10) 1) (Null)
-    ///        2) (Null Array)
-    ///        3) OK
-    ///        4) (Error) Err
-    ///        5) (Integer) 123
-    ///        6) \"Bulk String\"
-    ///        7) (Empty Array)
-    ///        8) (Buffer) 00 64
-    ///        9) 1) (Empty Array)
-    ///           2) (Integer) 123
-    ///           3) \"Bulk String\"
-    ///    11) (Null)
-    /// 13) (Null)
-    /// ```
-    pub fn to_string_pretty(&self) -> String {
-        match *self {
-            Value::Null => "(Null)".to_string(),
-            Value::NullArray => "(Null Array)".to_string(),
-            Value::String(ref val) => val.to_string(),
-            Value::Error(ref val) => format!("(Error) {}", val),
-            Value::Integer(ref val) => format!("(Integer) {}", val.to_string()),
-            Value::Bulk(ref val) => format!("\"{}\"", val),
-            Value::BufBulk(ref val) => {
-                if val.is_empty() {
-                    return "(Empty Buffer)".to_string();
-                }
-                let mut string = String::new();
-                for u in val.iter().take(16) {
-                    string.push_str(&format_to_hex_str(u));
-                }
-                if val.len() > 16 {
-                    string.push_str(" ...");
-                }
-                format!("(Buffer) {}", &string[1..])
+    pub fn len(&self) -> usize {
+        const CRLF_LEN: usize = 2;
+        match self {
+            Value::SimpleString(s) => 1 + s.len() + CRLF_LEN,
+            Value::Error(e) => 1 + e.len() + CRLF_LEN,
+            Value::Integer(i) => 1 + i.to_string().len() + CRLF_LEN,
+            Value::BulkString(None) => 1 + b"-1".len() + CRLF_LEN,
+            Value::BulkString(Some(s)) => {
+                1 + s.len().to_string().len() + CRLF_LEN + s.len() + CRLF_LEN
             }
-            Value::Array(ref val) => format_array_to_str(val, 0),
-        }
-    }
-    /// [DEPRECATED] Alias of to_string_pretty.
-    pub fn to_beautify_string(&self) -> String {
-        self.to_string_pretty()
-    }
-}
-
-unsafe impl Sync for Value {}
-unsafe impl Send for Value {}
-
-fn format_to_hex_str(u: &u8) -> String {
-    if *u >= 16 {
-        format!(" {:x}", u)
-    } else {
-        format!(" 0{:x}", u)
-    }
-}
-
-fn format_index_str(index: usize, num_len: usize) -> String {
-    let mut string = index.to_string();
-    let len = string.len();
-
-    if num_len > len {
-        let mut len = len;
-        string.reserve(num_len - len);
-        loop {
-            string.insert(0, ' ');
-            len += 1;
-            if num_len == len {
-                break;
+            Value::Array(None) => 1 + b"-1".len() + CRLF_LEN,
+            Value::Array(Some(array)) => {
+                1 + array.len().to_string().len()
+                    + CRLF_LEN
+                    + array.iter().map(|s| s.len()).sum::<usize>()
             }
         }
     }
-    format!("{}) ", string)
-}
-
-fn format_array_to_str(array: &[Value], min_index_len: usize) -> String {
-    if array.is_empty() {
-        return "(Empty Array)".to_string();
-    }
-
-    let mut string = String::new();
-    let mut index_len = min_index_len;
-    let len = array.len();
-    let num_len = len.to_string().len();
-    if num_len > index_len {
-        index_len = num_len;
-    }
-    for (i, value) in array.iter().enumerate() {
-        // first element don't need indent.
-        let num_len = if i == 0 {
-            index_len - min_index_len
-        } else {
-            index_len
-        };
-        string.push_str(&format_index_str(i + 1, num_len));
-        match *value {
-            Value::Array(ref sub) => string.push_str(&format_array_to_str(sub, index_len + 3)),
-            _ => string.push_str(&value.to_string_pretty()),
-        };
-        if i + 1 < len {
-            string.push('\n');
-        }
-    }
-    string
 }
 
 #[cfg(test)]
@@ -242,186 +104,106 @@ mod tests {
 
     #[test]
     fn enum_is_null() {
-        assert_eq!(Value::Null.is_null(), true);
-        assert_eq!(Value::NullArray.is_null(), true);
-        assert_eq!(Value::String("OK".to_string()).is_null(), false);
-        assert_eq!(Value::Error("Err".to_string()).is_null(), false);
+        assert_eq!(Value::BulkString(None).is_null(), true);
+        assert_eq!(Value::Array(None).is_null(), true);
+        assert_eq!(Value::SimpleString(b"OK").is_null(), false);
+        assert_eq!(Value::Error(b"aa").is_null(), false);
         assert_eq!(Value::Integer(123).is_null(), false);
-        assert_eq!(Value::Bulk("Bulk".to_string()).is_null(), false);
-        assert_eq!(Value::BufBulk(vec![79, 75]).is_null(), false);
-        assert_eq!(Value::Array(vec![Value::Null, Value::Integer(123)]).is_null(),
-                   false);
+        assert_eq!(Value::BulkString(Some(b"Bulk")).is_null(), false);
+        assert_eq!(
+            Value::BulkString(Some(vec![79, 75].as_slice())).is_null(),
+            false
+        );
+        assert_eq!(
+            Value::Array(Some(vec![Value::BulkString(None), Value::Integer(123)])).is_null(),
+            false
+        );
     }
 
     #[test]
     fn enum_is_error() {
-        assert_eq!(Value::Null.is_error(), false);
-        assert_eq!(Value::NullArray.is_error(), false);
-        assert_eq!(Value::String("OK".to_string()).is_error(), false);
-        assert_eq!(Value::Error("".to_string()).is_error(), true);
-        assert_eq!(Value::Error("Err".to_string()).is_error(), true);
+        assert_eq!(Value::BulkString(None).is_error(), false);
+        assert_eq!(Value::Array(None).is_error(), false);
+        assert_eq!(Value::SimpleString(b"OK").is_error(), false);
+        assert_eq!(Value::Error(b"").is_error(), true);
+        assert_eq!(Value::Error(b"Err").is_error(), true);
         assert_eq!(Value::Integer(123).is_error(), false);
-        assert_eq!(Value::Bulk("Bulk".to_string()).is_error(), false);
-        assert_eq!(Value::BufBulk(vec![79, 75]).is_error(), false);
-        assert_eq!(Value::Array(vec![Value::Null, Value::Integer(123)]).is_error(),
-                   false);
+        assert_eq!(Value::BulkString(Some(b"Bulk")).is_error(), false);
+        assert_eq!(
+            Value::BulkString(Some(vec![79, 75].as_slice())).is_error(),
+            false
+        );
+        assert_eq!(
+            Value::Array(Some(vec![Value::BulkString(None), Value::Integer(123)])).is_error(),
+            false
+        );
     }
 
     #[test]
     fn enum_encode_null() {
-        let val = Value::Null;
-        assert_eq!(val.to_encoded_string().unwrap(), "$-1\r\n");
+        let val = Value::BulkString(None);
+        assert_eq!(val.to_vec().as_slice(), b"$-1\r\n");
     }
 
     #[test]
     fn enum_encode_nullarray() {
-        let val = Value::NullArray;
-        assert_eq!(val.to_encoded_string().unwrap(), "*-1\r\n");
+        let val = Value::Array(None);
+        assert_eq!(val.to_vec().as_slice(), b"*-1\r\n");
     }
 
     #[test]
     fn enum_encode_string() {
-        let val = Value::String("OK正".to_string());
-        assert_eq!(val.to_encoded_string().unwrap(), "+OK正\r\n");
+        let val = Value::SimpleString("OK正".as_bytes());
+        assert_eq!(val.to_vec().as_slice(), "+OK正\r\n".as_bytes());
     }
 
     #[test]
     fn enum_encode_error() {
-        let val = Value::Error("error message".to_string());
-        assert_eq!(val.to_encoded_string().unwrap(), "-error message\r\n");
+        let val = Value::Error(b"error message");
+        assert_eq!(val.to_vec().as_slice(), b"-error message\r\n");
     }
 
     #[test]
     fn enum_encode_integer() {
         let val = Value::Integer(123456789);
-        assert_eq!(val.to_encoded_string().unwrap(), ":123456789\r\n");
+        assert_eq!(val.to_vec().as_slice(), b":123456789\r\n");
 
         let val = Value::Integer(-123456789);
-        assert_eq!(val.to_encoded_string().unwrap(), ":-123456789\r\n");
+        assert_eq!(val.to_vec().as_slice(), b":-123456789\r\n");
     }
 
     #[test]
     fn enum_encode_bulk() {
-        let val = Value::Bulk("OK正".to_string());
-        assert_eq!(val.to_encoded_string().unwrap(), "$5\r\nOK正\r\n");
+        let val = Value::BulkString(Some("OK正".as_bytes()));
+        assert_eq!(val.to_vec().as_slice(), "$5\r\nOK正\r\n".as_bytes());
     }
 
     #[test]
     fn enum_encode_bufbulk() {
-        let val = Value::BufBulk(vec![79, 75]);
-        assert_eq!(val.to_encoded_string().unwrap(), "$2\r\nOK\r\n");
+        let val = Value::BulkString(Some(&[79, 75]));
+        assert_eq!(&val.to_vec(), b"$2\r\nOK\r\n");
     }
 
     #[test]
     fn enum_encode_array() {
-        let val = Value::Array(Vec::new());
-        assert_eq!(val.to_encoded_string().unwrap(), "*0\r\n");
+        let val = Value::Array(Some(Vec::new()));
+        assert_eq!(val.to_vec(), b"*0\r\n".to_vec());
 
         let mut vec: Vec<Value> = Vec::new();
-        vec.push(Value::Null);
-        vec.push(Value::NullArray);
-        vec.push(Value::String("OK".to_string()));
-        vec.push(Value::Error("message".to_string()));
+        vec.push(Value::BulkString(None));
+        vec.push(Value::Array(None));
+        vec.push(Value::SimpleString(b"OK"));
+        vec.push(Value::Error(b"message"));
         vec.push(Value::Integer(123456789));
-        vec.push(Value::Bulk("Hello".to_string()));
-        vec.push(Value::BufBulk(vec![79, 75]));
-        let val = Value::Array(vec);
-        assert_eq!(val.to_encoded_string().unwrap(),
-                   "*7\r\n$-1\r\n*-1\r\n+OK\r\n-message\r\n:123456789\r\n$5\r\nHello\r\n\
-                   $2\r\nOK\r\n");
-    }
-
-    #[test]
-    fn enum_to_string_pretty() {
-        // test the alias of to_string_pretty.
-        assert_eq!(Value::Null.to_beautify_string(), "(Null)");
-
-        assert_eq!(Value::Null.to_string_pretty(), "(Null)");
-        assert_eq!(Value::NullArray.to_string_pretty(), "(Null Array)");
-        assert_eq!(Value::String("OK".to_string()).to_string_pretty(), "OK");
-        assert_eq!(Value::Error("Err".to_string()).to_string_pretty(),
-                   "(Error) Err");
-        assert_eq!(Value::Integer(123).to_string_pretty(), "(Integer) 123");
-        assert_eq!(Value::Bulk("Bulk String".to_string()).to_string_pretty(),
-                   "\"Bulk String\"");
-        assert_eq!(Value::BufBulk(vec![]).to_string_pretty(), "(Empty Buffer)");
-        assert_eq!(Value::BufBulk(vec![0, 100]).to_string_pretty(),
-                   "(Buffer) 00 64");
-        assert_eq!(Value::BufBulk(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-                                       17, 18])
-                           .to_string_pretty(),
-                   "(Buffer) 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f ...");
-        assert_eq!(Value::Array(vec![]).to_string_pretty(), "(Empty Array)");
-        assert_eq!(Value::Array(vec![Value::Null, Value::Integer(123)]).to_string_pretty(),
-                   "1) (Null)\n2) (Integer) 123");
-
-        let _values = vec![Value::Null,
-                           Value::NullArray,
-                           Value::String("OK".to_string()),
-                           Value::Error("Err".to_string()),
-                           Value::Integer(123),
-                           Value::Bulk("Bulk String".to_string()),
-                           Value::Array(vec![]),
-                           Value::BufBulk(vec![0, 100]),
-                           Value::Array(vec![Value::Array(vec![]),
-                                             Value::Integer(123),
-                                             Value::Bulk("Bulk String".to_string())])];
-        let mut values = _values.clone();
-        values.push(Value::Array(_values));
-        values.push(Value::Null);
-        let mut _values = values.clone();
-        _values.push(Value::Array(values));
-        _values.push(Value::Null);
-
-        let enum_fmt_result = " 1) (Null)
- 2) (Null Array)
- 3) OK
- 4) (Error) Err
- 5) (Integer) 123
- 6) \"Bulk String\"
- 7) (Empty Array)
- 8) (Buffer) 00 64
- 9) 1) (Empty Array)
-    2) (Integer) 123
-    3) \"Bulk String\"
-10) 1) (Null)
-    2) (Null Array)
-    3) OK
-    4) (Error) Err
-    5) (Integer) 123
-    6) \"Bulk String\"
-    7) (Empty Array)
-    8) (Buffer) 00 64
-    9) 1) (Empty Array)
-       2) (Integer) 123
-       3) \"Bulk String\"
-11) (Null)
-12) 1) (Null)
-    2) (Null Array)
-    3) OK
-    4) (Error) Err
-    5) (Integer) 123
-    6) \"Bulk String\"
-    7) (Empty Array)
-    8) (Buffer) 00 64
-    9) 1) (Empty Array)
-       2) (Integer) 123
-       3) \"Bulk String\"
-   10) 1) (Null)
-       2) (Null Array)
-       3) OK
-       4) (Error) Err
-       5) (Integer) 123
-       6) \"Bulk String\"
-       7) (Empty Array)
-       8) (Buffer) 00 64
-       9) 1) (Empty Array)
-          2) (Integer) 123
-          3) \"Bulk String\"
-   11) (Null)
-13) (Null)";
-
-        assert_eq!(Value::Array(_values).to_string_pretty(), enum_fmt_result);
-        // println!("{}", Value::Array(_values).to_string_pretty());
+        vec.push(Value::BulkString(Some(b"Hello")));
+        let s = vec![79, 75];
+        vec.push(Value::BulkString(Some(&s)));
+        let val = Value::Array(Some(vec));
+        assert_eq!(
+            val.to_vec(),
+            b"*7\r\n$-1\r\n*-1\r\n+OK\r\n-message\r\n:123456789\r\n$5\r\nHello\r\n\
+             $2\r\nOK\r\n"
+                .to_vec()
+        );
     }
 }
