@@ -15,7 +15,7 @@ const CRLF_BYTES: &[u8] = b"\r\n";
 pub fn encode(value: &Value, buf: &mut BytesMut) -> usize {
     let initial = buf.len();
 
-    let value_len = value.len();
+    let value_len = value.serialize_len();
     buf.reserve(value_len);
     match value {
         Value::SimpleString(val) => {

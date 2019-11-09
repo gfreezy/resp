@@ -4,9 +4,8 @@ use super::serialize::encode;
 use crate::parser::parse_resp_value;
 use bytes::BytesMut;
 use std::vec::Vec;
-use nom::error::ErrorKind;
 
-enum Error {
+pub enum Error {
     InvalidData,
     NeedMoreData,
 }
@@ -26,9 +25,9 @@ pub enum Value<'a> {
 impl<'a> Value<'a> {
     pub fn parse(buf: Slice) -> Result<(Slice, Value), Error> {
         match parse_resp_value(buf) {
-            v @ Ok(_) => v,
-            Err(nom::Err::Incomplete(n)) => Err(Error::NeedMoreData),
-            Err(nom::Err::Error(e)) | Err(nom::Err::Failure(e)) => ,
+            Ok(v) => Ok(v),
+            Err(nom::Err::Incomplete(_)) => Err(Error::NeedMoreData),
+            Err(nom::Err::Error(_)) | Err(nom::Err::Failure(_)) => Err(Error::InvalidData),
         }
     }
 
@@ -78,7 +77,7 @@ impl<'a> Value<'a> {
         buf.to_vec()
     }
 
-    pub fn len(&self) -> usize {
+    pub fn serialize_len(&self) -> usize {
         const CRLF_LEN: usize = 2;
         match self {
             Value::SimpleString(s) => 1 + s.len() + CRLF_LEN,
@@ -92,7 +91,7 @@ impl<'a> Value<'a> {
             Value::Array(Some(array)) => {
                 1 + array.len().to_string().len()
                     + CRLF_LEN
-                    + array.iter().map(|s| s.len()).sum::<usize>()
+                    + array.iter().map(|s| s.serialize_len()).sum::<usize>()
             }
         }
     }
