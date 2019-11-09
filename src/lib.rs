@@ -4,4 +4,4 @@ mod parser;
 mod serialize;
 mod value;
 
-pub use value::Value;
+pub use value::{Error, Value};
